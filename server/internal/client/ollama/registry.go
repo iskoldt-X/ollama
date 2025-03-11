@@ -475,135 +475,100 @@ func (r *Registry) Pull(ctx context.Context, name string) error {
 
 		t.update(l, 0, nil)
 
-		blobURL := fmt.Sprintf("%s://%s/v2/%s/%s/blobs/%s", scheme, n.Host(), n.Namespace(), n.Model(), l.Digest)
-		if l.Size <= r.maxChunkingThreshold() {
+		fetchTargetRequest := sync.OnceValues(func() (*http.Request, error) {
+			// TODO(bmizerany): Make this a return header for
+			// chunksums from the registry, and avoid the need for
+			// this pre-fetch. This can then be part of the start
+			// of the checksums sequence, and all of this can be
+			// removed, simplifying much of what is going on in
+			// here.
+			//
+			// To avoid costly redirects per chunk, we determine
+			// the final request once here, and reuse it for each
+			// chunk.
+			blobURL := fmt.Sprintf("%s://%s/v2/%s/%s/blobs/%s",
+				scheme,
+				n.Host(),
+				n.Namespace(),
+				n.Model(),
+				l.Digest,
+			)
 			req, err := r.newRequest(ctx, "GET", blobURL, nil)
 			if err != nil {
-				t.update(l, 0, err)
-				continue
+				return nil, err
 			}
-			g.Go(func() error {
-				// TODO(bmizerany): retry/backoff like below in
-				// the chunking case
-				res, err := sendRequest(r.client(), req)
-				if err != nil {
-					return err
-				}
-				defer res.Body.Close()
-				err = c.Put(l.Digest, res.Body, l.Size)
-				if err == nil {
-					t.update(l, l.Size, nil)
-				}
-				return err
-			})
-		} else {
-			fetchTargetRequest := sync.OnceValues(func() (*http.Request, error) {
-				// Send a tracer request to find the target
-				// download URL.
-				//
-				// Without this, we'll end up with 2x the
-				// roundtrips because the registry will send us
-				// to the same place per chunk, so just take
-				// the first and use it for all chunks.
-				//
-				// TODO(bmizerany): retry with backoff
-				req, err := r.newRequest(ctx, "GET", blobURL, nil)
-				if err != nil {
-					return nil, err
-				}
-				req.Header.Set("Range", "bytes=0-0")
-				res, err := sendRequest(r.client(), req)
-				if err != nil {
-					return nil, err
-				}
-				res.Body.Close()
-				return res.Request.WithContext(req.Context()), nil
-			})
-
-			// Prefetch the target request while we start looking
-			// for chunksums.
-			go fetchTargetRequest()
-
-			chunked, err := c.Chunked(l.Digest, l.Size)
-			if err != nil {
-				t.update(l, 0, err)
-				continue
-			}
-			defer chunked.Close()
-
-			chunksumsURL := fmt.Sprintf("%s://%s/v2/%s/%s/chunksums/%s", scheme, n.Host(), n.Namespace(), n.Model(), l.Digest)
-			req, err := r.newRequest(ctx, "GET", chunksumsURL, nil)
-			if err != nil {
-				t.update(l, 0, err)
-				continue
-			}
-
+			req.Header.Set("Range", "bytes=0-0")
 			res, err := sendRequest(r.client(), req)
 			if err != nil {
+				return nil, err
+			}
+			res.Body.Close()
+			return res.Request.WithContext(req.Context()), nil
+		})
+
+		// Prefetch the target request while we start looking
+		// for chunksums.
+		go fetchTargetRequest()
+
+		chunked, err := c.Chunked(l.Digest, l.Size)
+		if err != nil {
+			t.update(l, 0, err)
+			continue
+		}
+		defer chunked.Close()
+
+		var progress atomic.Int64
+		for cs, err := range r.chunksums(ctx, name, l) {
+			if err != nil {
+				t.update(l, progress.Load(), err)
+				break
+			}
+
+			// Prevent wasted efforts and duplicated calls
+			// to t.update, if the targetURL could not be
+			// obtained, by calling fetchTargetRequest
+			// before starting goroutines.
+			targetReq, err := fetchTargetRequest()
+			if err != nil {
+				// The target request failed, so we
+				// can't proceed. Update any traces and
+				// return.
 				t.update(l, 0, err)
-				continue
-			}
-			defer res.Body.Close()
-
-			if res.StatusCode != 200 {
-				t.update(l, 0, fmt.Errorf("chunksums: unexpected status code %d", res.StatusCode))
-				continue
+				return err
 			}
 
-			var progress atomic.Int64
-			for cs, err := range r.chunksums(l, res.Body) {
-				if err != nil {
-					t.update(l, progress.Load(), err)
-					break
-				}
+			g.Go(func() (err error) {
+				defer func() { t.update(l, progress.Load(), err) }()
 
-				// Prevent wasted efforts and duplicated calls
-				// to t.update, if the targetURL could not be
-				// obtained, by calling fetchTargetRequest
-				// before starting goroutines.
-				targetReq, err := fetchTargetRequest()
-				if err != nil {
-					// The target request failed, so we
-					// can't proceed. Update any traces and
-					// return.
-					t.update(l, 0, err)
-					return err
-				}
-
-				g.Go(func() (err error) {
-					defer func() { t.update(l, progress.Load(), err) }()
-
-					for _, err := range backoff.Loop(ctx, 3*time.Second) {
+				for _, err := range backoff.Loop(ctx, 3*time.Second) {
+					if err != nil {
+						return err
+					}
+					err := func() error {
+						req := targetReq.Clone(targetReq.Context())
+						req.Header.Set("Range", fmt.Sprintf("bytes=%s", cs.Chunk))
+						res, err := sendRequest(r.client(), req)
 						if err != nil {
 							return err
 						}
-						err := func() error {
-							req := targetReq.Clone(targetReq.Context())
-							req.Header.Set("Range", fmt.Sprintf("bytes=%s", cs.Chunk))
-							res, err := sendRequest(r.client(), req)
-							if err != nil {
-								return err
-							}
-							defer res.Body.Close()
+						defer res.Body.Close()
 
-							err = chunked.Put(cs.Chunk, cs.Digest, res.Body)
-							if err != nil {
-								return err
-							}
-
-							progress.Add(cs.Chunk.Size())
-							return nil
-						}()
-						if !canRetry(err) {
+						err = chunked.Put(cs.Chunk, cs.Digest, res.Body)
+						if err != nil {
 							return err
 						}
+
+						progress.Add(cs.Chunk.Size())
+						return nil
+					}()
+					if !canRetry(err) {
+						return err
 					}
-					return nil
-				})
-			}
+				}
+				return nil
+			})
 		}
 	}
-
 	if err := g.Wait(); err != nil {
 		return err
 	}
@@ -770,7 +735,7 @@ type chunksum struct {
 
 var errBrokenStream = errors.New("chunksums: final digest mismatch; possible broken stream")
 
-func (r *Registry) chunksums(l *Layer, body io.Reader) iter.Seq2[chunksum, error] {
+func (r *Registry) chunksums(ctx context.Context, name string, l *Layer) iter.Seq2[chunksum, error] {
 	return func(yield func(chunksum, error) bool) {
 		if l.Size < r.maxChunkingThreshold() {
 			// any layer under the threshold should be downloaded
@@ -778,7 +743,40 @@ func (r *Registry) chunksums(l *Layer, body io.Reader) iter.Seq2[chunksum, error
 			yield(chunksum{Chunk: blob.Chunk{Start: 0, End: l.Size - 1}, Digest: l.Digest}, nil)
 			return
 		}
-		s := bufio.NewScanner(body)
+
+		scheme, n, _, err := r.parseNameExtended(name)
+		if err != nil {
+			yield(chunksum{}, err)
+			return
+		}
+
+		chunksumsURL := fmt.Sprintf("%s://%s/v2/%s/%s/chunksums/%s",
+			scheme,
+			n.Host(),
+			n.Namespace(),
+			n.Model(),
+			l.Digest,
+		)
+
+		req, err := r.newRequest(ctx, "GET", chunksumsURL, nil)
+		if err != nil {
+			yield(chunksum{}, err)
+			return
+		}
+
+		res, err := sendRequest(r.client(), req)
+		if err != nil {
+			yield(chunksum{}, err)
+			return
+		}
+		defer res.Body.Close()
+		if res.StatusCode != 200 {
+			err := fmt.Errorf("chunksums: unexpected status code %d", res.StatusCode)
+			yield(chunksum{}, err)
+			return
+		}
+
+		s := bufio.NewScanner(res.Body)
 		s.Split(bufio.ScanWords)
 		for {
 			if !s.Scan() {
